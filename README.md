@@ -4,7 +4,7 @@
 [![rank](https://make.fun/badge/token-radar-01/raikodegen16/token-radar-01/rank.svg)](https://make.fun/bounty/token-radar-01/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=token-radar-01)
 [![reward](https://make.fun/badge/token-radar-01/raikodegen16/token-radar-01/reward.svg)](https://make.fun/bounty/token-radar-01?utm_source=github&utm_medium=readme&utm_campaign=token-radar-01)
 
-A token launch radar that ranks 226 pre-token DeFi protocols by implied token value, derived from TVL, 7-day growth, age and chain diversity, with a concrete farm plan for each protocol and an offline sortable dashboard.
+A token launch radar that ranks 226 pre-token DeFi protocols by implied token value, derived from TVL, 7-day growth, age, chain diversity and standing in their own category, with a concrete 8-step farm plan for each protocol and an offline sortable dashboard.
 
 ## Run it
 

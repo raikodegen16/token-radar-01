@@ -6,20 +6,23 @@
 // snapshot's live-token protocols are kept apart and shown as the market's own values, never mixed into
 // the ranked board.
 //
-// Implied value follows only from the snapshot's own figures (radar-2):
+// Implied value follows only from the snapshot's own figures (radar-3):
 //
 //   base       = tvl_usd x BASE_MULTIPLE
 //   growth     = clamp(change_7d, -60, 120) per cent
 //   growthMult = 1 + (growth / 100) x GROWTH_WEIGHT
-//   maturity   = 0.6 + min(age_days, 1095) / 1095 x 0.4   (age_days unknown: 365)
-//   diversity  = 1 + 0.05 x min(chains, 4)               (1 chain: 1.00, 5+ chains: 1.20)
-//   implied    = max(1, round(base x growthMult x maturity x diversity))
+//   maturity   = 0.55 + min(age_days, 1095) / 1095 x 0.45   (age_days unknown: 365)
+//   diversity  = 1 + 0.05 x min(chains, 4)                 (1 chain: 1.00, 5+ chains: 1.20)
+//   leadership = 1 + 0.05 x clamp(log2(tvl_usd / category_median_tvl), -4, 4)
+//   implied    = max(1, round(base x growthMult x maturity x diversity x leadership))
 //
 // TVL is the size of the prize, growth is its direction, maturity is how long the protocol has run
-// with no token (the longer it has waited, the likelier a launch is priced on its record), and
-// diversity is how widely it is distributed: a protocol live on several chains reaches more wallets
-// and more liquidity venues when a token does launch. No protocol name is ever special-cased: the
-// same function scores every row.
+// with no token (the longer it has waited, the likelier a launch is priced on its record), diversity
+// is how widely it is distributed, and leadership is where it stands in its own category: a protocol
+// that leads its category by TVL is the one whose token would set that category's price, while one
+// far below its category's median is a follower. The category median is the median TVL of every
+// protocol the snapshot lists in that category, computed from the snapshot itself. No protocol name
+// is ever special-cased: the same function scores every row.
 
 /** The snapshot's protocol entry: exactly the ten fields the sealed input carries. */
 export interface SnapshotProtocol {
@@ -56,6 +59,8 @@ export interface ModelConstants {
   unknown_age_days: number;
   diversity_step: number;
   diversity_cap_chains: number;
+  leadership_step: number;
+  leadership_cap_log: number;
 }
 
 export const MODEL: ModelConstants = {
@@ -63,16 +68,18 @@ export const MODEL: ModelConstants = {
   growth_weight: 0.5,
   growth_floor: -60,
   growth_cap: 120,
-  maturity_floor: 0.6,
-  maturity_range: 0.4,
+  maturity_floor: 0.55,
+  maturity_range: 0.45,
   maturity_days: 1095,
   unknown_age_days: 365,
   diversity_step: 0.05,
   diversity_cap_chains: 4,
+  leadership_step: 0.05,
+  leadership_cap_log: 4,
 };
 
 /** The model's version label: the dashboard names it and the rules quote it. */
-export const MODEL_VERSION = 'radar-2';
+export const MODEL_VERSION = 'radar-3';
 
 /** How many pre-token protocols below the watchlist floor the early radar carries, by TVL. */
 export const EARLY_ROWS = 220;
@@ -109,6 +116,10 @@ export interface BoardRow {
     growth_multiplier: number;
     maturity_multiplier: number;
     diversity_multiplier: number;
+    leadership_multiplier: number;
+    category_median_tvl: number;
+    category_rank: number;
+    category_size: number;
     chain_count: number;
     age_days: number | null;
   };
@@ -131,6 +142,10 @@ export interface RadarRow {
   growth_multiplier: number;
   maturity_multiplier: number;
   diversity_multiplier: number;
+  leadership_multiplier: number;
+  category_median_tvl: number;
+  category_rank: number;
+  category_size: number;
 }
 
 /** A live-token protocol: it already trades, so the board shows the market's own value, not a model's. */
@@ -156,6 +171,7 @@ export interface RadarData {
   board_size: number;
   early_size: number;
   live_size: number;
+  category_leaders: number;
   rows: RadarRow[];
   live: LiveRow[];
 }
@@ -184,8 +200,57 @@ export function ageDays(asOf: string, listedAt: string | null): number | null {
   return Math.max(0, Math.floor((a - b) / DAY_MS));
 }
 
-/** The four multipliers and the implied value one protocol gets under `model`. */
-export function impliedValue(protocol: SnapshotProtocol, asOf: string, model: ModelConstants): { implied: number; growthPct: number; growthMult: number; maturityMult: number; diversityMult: number; age: number | null } {
+/** The median of a list of whole dollars. */
+function median(values: number[]): number {
+  const sorted = [...values].sort((a, b) => a - b);
+  const mid = sorted.length >> 1;
+  return sorted.length % 2 === 1 ? sorted[mid]! : (sorted[mid - 1]! + sorted[mid]!) / 2;
+}
+
+/** One category's own figures, from every protocol the snapshot lists in it: its median TVL, and each
+ *  protocol's rank by TVL within it (1 is the category's biggest) and the category's size. */
+export interface CategoryStats {
+  median_tvl: number;
+  rank_by_tvl: Map<string, number>;
+  size: number;
+}
+
+export function categoryStats(protocols: SnapshotProtocol[]): Map<string, CategoryStats> {
+  const groups = new Map<string, SnapshotProtocol[]>();
+  for (const p of protocols) {
+    const key = p.category ?? '';
+    const list = groups.get(key);
+    if (list === undefined) groups.set(key, [p]);
+    else list.push(p);
+  }
+  const out = new Map<string, CategoryStats>();
+  for (const [key, list] of groups) {
+    const ordered = [...list].sort((a, b) => b.tvl_usd - a.tvl_usd || (a.slug < b.slug ? -1 : a.slug > b.slug ? 1 : 0));
+    const rankByTvl = new Map<string, number>();
+    ordered.forEach((p, i) => rankByTvl.set(p.slug, i + 1));
+    out.set(key, { median_tvl: median(list.map((p) => p.tvl_usd)), rank_by_tvl: rankByTvl, size: list.length });
+  }
+  return out;
+}
+
+/** The five multipliers and the implied value one protocol gets under `model`. */
+export function impliedValue(
+  protocol: SnapshotProtocol,
+  asOf: string,
+  model: ModelConstants,
+  stats: CategoryStats,
+): {
+  implied: number;
+  growthPct: number;
+  growthMult: number;
+  maturityMult: number;
+  diversityMult: number;
+  leadershipMult: number;
+  age: number | null;
+  categoryMedian: number;
+  categoryRank: number;
+  categorySize: number;
+} {
   const age = ageDays(asOf, protocol.listed_at);
   const rawGrowth = finite(protocol.change_7d, 0);
   const growthPct = Math.min(model.growth_cap, Math.max(model.growth_floor, rawGrowth));
@@ -194,9 +259,15 @@ export function impliedValue(protocol: SnapshotProtocol, asOf: string, model: Mo
   const maturityMult = model.maturity_floor + (Math.min(Math.max(ageForModel, 0), model.maturity_days) / model.maturity_days) * model.maturity_range;
   const chainCount = Array.isArray(protocol.chains) ? protocol.chains.length : 0;
   const diversityMult = 1 + model.diversity_step * Math.min(chainCount, model.diversity_cap_chains);
+  const categoryMedian = stats.median_tvl;
+  const categoryRank = stats.rank_by_tvl.get(protocol.slug) ?? stats.size;
+  const categorySize = stats.size;
+  const ratio = categoryMedian > 0 ? protocol.tvl_usd / categoryMedian : 1;
+  const logRatio = Math.max(-model.leadership_cap_log, Math.min(model.leadership_cap_log, Math.log2(ratio)));
+  const leadershipMult = 1 + model.leadership_step * logRatio;
   const base = protocol.tvl_usd * model.base_multiple;
-  const implied = Math.max(1, Math.round(base * growthMult * maturityMult * diversityMult));
-  return { implied, growthPct, growthMult, maturityMult, diversityMult, age };
+  const implied = Math.max(1, Math.round(base * growthMult * maturityMult * diversityMult * leadershipMult));
+  return { implied, growthPct, growthMult, maturityMult, diversityMult, leadershipMult, age, categoryMedian, categoryRank, categorySize };
 }
 
 /** DefiLlama's version-marker rule: a name ending in a release is a pool of another protocol. */
@@ -228,6 +299,7 @@ export interface BoardSummary {
 /** The protocols the board ranks, strongest first, with ranks 1..n. */
 export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): BoardRow[] {
   const index = bySlug(snapshot.protocols);
+  const stats = categoryStats(snapshot.protocols);
   const chosen = new Map<string, SnapshotProtocol>();
   // The watchlist is the floor: every slug, even one the snapshot no longer carries (it cannot, but the
   // board's coverage is the gate's row and is never gambled on a missing record).
@@ -244,8 +316,9 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): B
   for (const p of early) chosen.set(p.slug, p);
 
   const scored = [...chosen.values()].map((p) => {
-    const { implied, growthPct, growthMult, maturityMult, diversityMult, age } = impliedValue(p, snapshot.as_of, model);
-    return { p, implied, growthPct, growthMult, maturityMult, diversityMult, age };
+    const catStats = stats.get(p.category ?? '')!;
+    const s = impliedValue(p, snapshot.as_of, model, catStats);
+    return { p, ...s };
   });
   scored.sort((a, b) => b.implied - a.implied || (a.p.slug < b.p.slug ? -1 : a.p.slug > b.p.slug ? 1 : 0));
   return scored.map((s, i) => ({
@@ -269,6 +342,10 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): B
       growth_multiplier: round4(s.growthMult),
       maturity_multiplier: round4(s.maturityMult),
       diversity_multiplier: round4(s.diversityMult),
+      leadership_multiplier: round4(s.leadershipMult),
+      category_median_tvl: s.categoryMedian,
+      category_rank: s.categoryRank,
+      category_size: s.categorySize,
       chain_count: Array.isArray(s.p.chains) ? s.p.chains.length : 0,
       age_days: s.age,
     },
@@ -366,8 +443,11 @@ function weeklyActionFor(p: SnapshotProtocol, chain: string): string {
 }
 
 /**
- * A protocol's farm plan: seven steps, each an action with a cost and a time. The plan is derived from
- * the protocol's own record (category, chains, TVL, age), never from a hand-written list of names.
+ * A protocol's farm plan: eight steps, each an action with a cost and a time. The plan is derived from
+ * the protocol's own record (category, chains, TVL, age, seven-day growth), never from a hand-written
+ * list of names. The last step is what to watch for next: a falling TVL is the first sign a farm is
+ * cooling, a young protocol's first points announcement is its farm window opening, and an old
+ * protocol's governance forum is where a token proposal first appears.
  */
 export function farmSteps(p: SnapshotProtocol, age: number | null): FarmStep[] {
   const chain = chainOf(p);
@@ -376,6 +456,15 @@ export function farmSteps(p: SnapshotProtocol, age: number | null): FarmStep[] {
   const gas = gasFor(chain);
   const action = actionFor(p, capital, chain);
   const weekly = weeklyActionFor(p, chain);
+  const growth = finite(p.change_7d, 0);
+  const watch =
+    p.change_7d !== null && growth < -10
+      ? `TVL fell ${Math.abs(growth).toFixed(1)}% in the last seven days, so watch for it to steady before adding more capital; a falling TVL is the first sign a farm is cooling.`
+      : age !== null && age < 180
+        ? `This protocol is under six months old, so watch for its first points or rewards announcement; a new protocol usually opens its farm window within its first year.`
+        : age !== null && age >= 730
+          ? `This protocol has run ${(age / 365).toFixed(1)} years with no token, so watch its governance forum for a token proposal; that is the usual first public step toward a launch.`
+          : `Watch the protocol's own announcements page for a points program; that is the usual pre-launch signal, and never trust a points page linked from social media.`;
   return [
     {
       text: `Use a fresh wallet that holds only the funds you plan to farm, and keep its seed phrase offline.`,
@@ -411,6 +500,11 @@ export function farmSteps(p: SnapshotProtocol, age: number | null): FarmStep[] {
       text: `Write the wallet, the dates and every transaction in a farm log so you can repeat the position or unwind it.`,
       cost: 'nothing but the log',
       time: '5 minutes',
+    },
+    {
+      text: watch,
+      cost: 'nothing but the watch',
+      time: '10 minutes a week',
     },
   ];
 }
@@ -449,6 +543,10 @@ export function radarRow(row: BoardRow): RadarRow {
     growth_multiplier: row.model.growth_multiplier,
     maturity_multiplier: row.model.maturity_multiplier,
     diversity_multiplier: row.model.diversity_multiplier,
+    leadership_multiplier: row.model.leadership_multiplier,
+    category_median_tvl: row.model.category_median_tvl,
+    category_rank: row.model.category_rank,
+    category_size: row.model.category_size,
   };
 }
 
@@ -457,6 +555,7 @@ export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): {
   const board = buildBoard(snapshot, model);
   const live = liveRows(snapshot);
   const early = board.filter((r) => !snapshot.watchlist.includes(r.slug)).length;
+  const leaders = board.filter((r) => r.model.category_rank === 1).length;
   const radar: RadarData = {
     as_of: snapshot.as_of,
     source: snapshot.source,
@@ -468,6 +567,7 @@ export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): {
     board_size: board.length,
     early_size: early,
     live_size: live.length,
+    category_leaders: leaders,
     rows: board.map(radarRow),
     live,
   };
